@@ -16,6 +16,22 @@ from app.modules.online_booking.service import reserve
 from app.modules.schedules.services.availability import AvailabilityService, ResolvedRange
 
 
+def proof_for(clinic_id):
+    from altcha import Payload, create_challenge, solve_challenge
+
+    from app.modules.online_booking.captcha import _secret
+
+    challenge = create_challenge(
+        "PBKDF2/SHA-256",
+        1000,
+        counter=0,
+        expires_at=datetime.now(UTC) + timedelta(minutes=9),
+        data={"clinic": str(clinic_id)},
+        hmac_secret=_secret(clinic_id),
+    )
+    return Payload(challenge, solve_challenge(challenge)).to_base64()
+
+
 @pytest.fixture
 def open_hours(monkeypatch):
     async def resolve(db, clinic_id, start, end, professional_id=None):
@@ -88,11 +104,20 @@ async def test_request_confirm_accept_and_conflict(
     availability = await client.get(f"{url}/availability", params={"day": tomorrow.isoformat()})
     assert availability.status_code == 200
     assert start.isoformat() in availability.json()["data"]["starts"]
+    from altcha import Challenge, Payload, solve_challenge
+
+    challenge_response = await client.get(f"{url}/challenge")
+    assert challenge_response.status_code == 200
+    assert challenge_response.headers["cache-control"] == "no-store"
+    issued = Challenge.from_dict(challenge_response.json())
+    solution = solve_challenge(issued, timeout=20)
+    assert solution is not None
     body = {
         "start_time": start.isoformat(),
         "contact_name": "Synthetic",
         "contact_email": "test@example.com",
         "reason": "checkup",
+        "altcha": Payload(issued, solution).to_base64(),
     }
     first = await client.post(f"{url}/requests", json=body)
     assert first.status_code == 201, first.text
@@ -252,9 +277,11 @@ async def test_simultaneous_http_requests(client, db_session, test_clinic, open_
                 "contact_name": "Synthetic",
                 "contact_email": "parallel@example.com",
                 "reason": "checkup",
+                "altcha": proof_for(test_clinic.id),
             }
             responses = await asyncio.gather(
-                parallel.post(url, json=body), parallel.post(url, json=body)
+                parallel.post(url, json=body),
+                parallel.post(url, json={**body, "altcha": proof_for(test_clinic.id)}),
             )
             assert sorted(r.status_code for r in responses) == [201, 409], [
                 r.text for r in responses
@@ -348,6 +375,7 @@ async def test_rejection_sends_message_and_releases_hold(
         "contact_name": "Synthetic",
         "contact_email": "reject@example.com",
         "reason": "checkup",
+        "altcha": proof_for(test_clinic.id),
     }
     response = await client.post(f"{base}/requests", json=body)
     assert response.status_code == 201, response.text
@@ -368,6 +396,7 @@ async def test_rejection_sends_message_and_releases_hold(
     while await dispatch_one(db_session):
         await db_session.commit()
     assert delivery[-1].body_text == "Please call us"
+    body["altcha"] = proof_for(test_clinic.id)
     assert (await client.post(f"{base}/requests", json=body)).status_code == 201
 
 
@@ -885,3 +914,62 @@ async def test_patient_suggestions_match_email_or_normalized_phone(
             f"/api/v1/online_booking/requests/{uuid4()}/patient-suggestions", headers=headers
         )
     ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_altcha_rejects_forgery_expiration_cross_clinic_and_replay(db_session, test_clinic):
+    from altcha import Payload, create_challenge, solve_challenge
+    from fastapi import HTTPException
+
+    from app.modules.online_booking.captcha import _secret, consume
+
+    async def rejected(proof, clinic_id=test_clinic.id):
+        with pytest.raises(HTTPException):
+            await consume(db_session, clinic_id, proof)
+
+    await rejected("not-a-payload")
+    valid = proof_for(test_clinic.id)
+    await rejected(valid, uuid4())
+    expired = create_challenge(
+        "PBKDF2/SHA-256",
+        1000,
+        counter=0,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        data={"clinic": str(test_clinic.id)},
+        hmac_secret=_secret(test_clinic.id),
+    )
+    await rejected(Payload(expired, solve_challenge(expired)).to_base64())
+    parsed = Payload.from_base64(valid)
+    parsed.challenge.parameters.cost = 1
+    await rejected(parsed.to_base64())
+    await consume(db_session, test_clinic.id, valid)
+    with pytest.raises(HTTPException) as replay:
+        await consume(db_session, test_clinic.id, valid)
+    assert replay.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_altcha_replay_is_atomic_across_transactions(db_session, test_clinic):
+    from fastapi import HTTPException
+
+    from app.config import settings
+    from app.modules.online_booking.captcha import consume
+
+    encoded = proof_for(test_clinic.id)
+    engine = create_async_engine(settings.DATABASE_URL)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def redeem():
+        async with maker() as session:
+            try:
+                await consume(session, test_clinic.id, encoded)
+                await session.commit()
+                return 201
+            except HTTPException as exc:
+                await session.rollback()
+                return exc.status_code
+
+    try:
+        assert sorted(await asyncio.gather(redeem(), redeem())) == [201, 409]
+    finally:
+        await engine.dispose()

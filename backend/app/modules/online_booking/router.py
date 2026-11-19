@@ -8,6 +8,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,7 @@ from app.modules.patients.models import Patient
 from app.modules.patients.service import PatientService
 from app.modules.schedules.services.clinic_hours import ClinicHoursService
 
+from .captcha import challenge, consume
 from .locking import lock_clinic
 from .models import BookingRequest, BookingSettings
 from .outbox import enqueue
@@ -108,6 +110,14 @@ async def availability(request: Request, clinic_id: UUID, day: date, db: DB):
     }
 
 
+@router.get("/public/{clinic_id}/challenge")
+@limiter.limit("30/minute")
+async def public_challenge(request: Request, clinic_id: UUID, db: DB):
+    await consume_rate("challenge-ip", request.client.host if request.client else "unknown", 240)
+    await public_settings(db, clinic_id)
+    return JSONResponse(challenge(clinic_id), headers={"Cache-Control": "no-store"})
+
+
 @router.post("/public/{clinic_id}/requests", status_code=201)
 @limiter.limit("10/hour")
 async def create_request(request: Request, clinic_id: UUID, data: RequestInput, db: DB):
@@ -116,6 +126,7 @@ async def create_request(request: Request, clinic_id: UUID, data: RequestInput, 
         raise HTTPException(400, "Unable to process request")
     await consume_rate("request-contact", f"{clinic_id}:{str(data.contact_email).lower()}", 3)
     config = await public_settings(db, clinic_id)
+    await consume(db, clinic_id, data.altcha)
     # The clinic lock also makes the contact quota check atomic for this clinic.
     await lock_clinic(db, clinic_id)
     now = datetime.now(UTC)
