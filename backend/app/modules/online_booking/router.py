@@ -66,6 +66,18 @@ async def public_config(request: Request, clinic_id: UUID, db: DB):
     return {
         "data": {
             "slot_minutes": config.slot_minutes,
+            "window_days": config.window_days,
+            "branding": {
+                key: getattr(config, key)
+                for key in (
+                    "logo_url",
+                    "accent_color",
+                    "title_es",
+                    "intro_es",
+                    "title_en",
+                    "intro_en",
+                )
+            },
             "timezone": await ClinicHoursService.get_clinic_timezone(db, clinic_id),
             "reasons": ["first_visit", "checkup"],
         }
@@ -98,16 +110,37 @@ async def update_settings(
 
 @router.get("/public/{clinic_id}/availability")
 @limiter.limit("60/minute")
-async def availability(request: Request, clinic_id: UUID, day: date, db: DB):
+async def availability(
+    request: Request,
+    clinic_id: UUID,
+    db: DB,
+    day: date | None = None,
+    from_day: date | None = None,
+    days: int = Query(default=7, ge=1, le=31),
+):
     await consume_rate("availability-ip", request.client.host if request.client else "unknown", 240)
     config = await public_settings(db, clinic_id)
-    starts = await slots(db, clinic_id, config, day, datetime.now(UTC))
-    return {
-        "data": {
-            "starts": [start.isoformat() for start in starts],
-            "slot_minutes": config.slot_minutes,
+    if (day is None) == (from_day is None):
+        raise HTTPException(422, "Provide day or from_day")
+    now = datetime.now(UTC)
+    if day is not None:
+        starts = await slots(db, clinic_id, config, day, now)
+        return {
+            "data": {
+                "starts": [start.isoformat() for start in starts],
+                "slot_minutes": config.slot_minutes,
+            }
         }
-    }
+    if from_day > date.max - timedelta(days=days - 1):
+        raise HTTPException(422, "Date range exceeds supported calendar")
+    entries = []
+    for offset in range(days):
+        date_value = from_day + timedelta(days=offset)
+        starts = await slots(db, clinic_id, config, date_value, now)
+        entries.append(
+            {"date": date_value.isoformat(), "starts": [start.isoformat() for start in starts]}
+        )
+    return {"data": {"days": entries, "slot_minutes": config.slot_minutes}}
 
 
 @router.get("/public/{clinic_id}/challenge")
@@ -162,6 +195,22 @@ async def create_request(request: Request, clinic_id: UUID, data: RequestInput, 
         raise HTTPException(409, str(exc)) from exc
     # The client-side confirmation page must consume the fragment explicitly.
     link = f"{config.public_url}#token={token}"
+    from zoneinfo import ZoneInfo
+
+    from babel.dates import format_datetime
+
+    zone = ZoneInfo(await ClinicHoursService.get_clinic_timezone(db, clinic_id))
+    when = format_datetime(start.astimezone(zone), "EEEE d MMMM, HH:mm", locale=data.language)
+    subject = (
+        "Confirma tu solicitud de cita"
+        if data.language == "es"
+        else "Confirm your appointment request"
+    )
+    message = (
+        f"Hemos recibido tu solicitud para el {when}. Confírmala en los próximos 10 minutos. Después, recepción te contactará para confirmar tu cita.\n{link}"
+        if data.language == "es"
+        else f"We received your request for {when}. Confirm it within 10 minutes. Reception will then contact you to confirm your appointment.\n{link}"
+    )
     enqueue(
         db,
         clinic_id,
@@ -169,8 +218,8 @@ async def create_request(request: Request, clinic_id: UUID, data: RequestInput, 
         "confirmation",
         {
             "email": email,
-            "subject": "Confirm your booking request",
-            "text": f"Confirm your request within 10 minutes: {link}",
+            "subject": subject,
+            "text": message,
             "link": link,
         },
     )
@@ -202,7 +251,13 @@ async def confirm(request: Request, clinic_id: UUID, data: ConfirmInput, db: DB)
     item.status = "confirmed"
     item.token_hash = None
     await db.flush()
-    return {"data": {"status": "confirmed"}}
+    return {
+        "data": {
+            "status": "confirmed",
+            "start_time": item.start_time.isoformat(),
+            "timezone": await ClinicHoursService.get_clinic_timezone(db, clinic_id),
+        }
+    }
 
 
 @router.get("/requests/count")
