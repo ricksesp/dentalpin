@@ -2,9 +2,10 @@
 
 Every handler follows the same contract:
 
-- Signature ``async def on_*(data: dict) -> None`` — matches the event bus
-  calling convention (``handler(data)``).
-- Opens its own DB session via :func:`async_session_maker`, commits on
+- Most handlers accept only a payload and open their own session.
+- The appointment-scheduled handler also accepts the publisher's session,
+  because a newly created patient may be uncommitted in that transaction.
+- Other handlers open their own DB session via :func:`async_session_maker`, commit on
   success and rolls back on failure — deliberately own-session (ADR 0019,
   audited in issue #183): the timeline is a log and must never be able to
   fail the event it is logging.
@@ -21,6 +22,8 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import EventType
 from app.database import async_session_maker
@@ -73,9 +76,8 @@ async def _record(
     Centralizes session management + error handling so each specific handler
     stays declarative.
 
-    own-session (issue #183): every handler in this module is payload-only —
-    the timeline records what the payload says happened and never re-reads
-    the publisher's rows, and ``source_id`` is polymorphic with no FK. The
+    own-session (issue #183): this helper records the payload without
+    re-reading publisher rows; ``source_id`` is polymorphic with no FK. The
     timeline is a log: it must not be able to fail the thing it is logging.
     """
     ids = _required_ids(data, "clinic_id", "patient_id", source_id_key)
@@ -120,9 +122,9 @@ async def _record(
 # ---------------------------------------------------------------------------
 
 
-async def on_appointment_scheduled(data: dict) -> None:
+async def on_appointment_scheduled(data: dict, *, db: AsyncSession | None = None) -> None:
     treatment = data.get("treatment_type") or "Consulta"
-    await _record(
+    kwargs = dict(
         event_type=EventType.APPOINTMENT_SCHEDULED,
         event_category="visit",
         source_table="appointments",
@@ -136,6 +138,30 @@ async def on_appointment_scheduled(data: dict) -> None:
         },
         occurred_at_key="start_time",
     )
+    if db is None:
+        await _record(**kwargs)
+        return
+    ids = _required_ids(data, "clinic_id", "patient_id", "appointment_id")
+    if ids is None:
+        return
+    clinic_id, patient_id, appointment_id = ids
+    try:
+        # Savepoint keeps a timeline failure from aborting appointment creation.
+        async with db.begin_nested():
+            await TimelineService.add_entry(
+                db=db,
+                clinic_id=clinic_id,
+                patient_id=patient_id,
+                event_type=EventType.APPOINTMENT_SCHEDULED,
+                event_category="visit",
+                source_table="appointments",
+                source_id=appointment_id,
+                title=kwargs["title"],
+                event_data=kwargs["event_data"],
+                occurred_at=_parse_dt(data.get("start_time")),
+            )
+    except Exception:
+        logger.exception("patient_timeline: failed to record %s", EventType.APPOINTMENT_SCHEDULED)
 
 
 async def on_appointment_completed(data: dict) -> None:

@@ -47,6 +47,8 @@ updates. See `docs/events-catalog.md` for the full list.
 
 ## Gotchas
 
+- `appointment.scheduled` uses the publisher session inside a savepoint: a newly created patient can be uncommitted. Other handlers keep the own-session behavior; direct handler calls without a session still use it. The savepoint keeps timeline failures from aborting the appointment.
+
 - **GDPR erasure: the feed is retained, never rewritten.**
   `erasure.PatientTimelineErasureContributor` is pulled by `gdpr` inside
   the erasure transaction (ADR 0038, #657) and writes nothing: it owns the
