@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Configure public booking rules and bilingual, ordered visit reasons in the administrator panel; check and hold the complete duration for each reason.
+- Store a size-limited validated clinic logo and expose it on a public, clinic-scoped image route; reuse clinic schedule closures.
+
 - Render the reception accept action with the primary button style.
 - Highlight available dates by week and group times by morning and afternoon. Require a validated international or Spanish phone number.
 - Configure public page logo, color and bilingual text from reception settings; show the requested time in confirmation and email.

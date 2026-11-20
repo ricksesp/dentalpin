@@ -1046,3 +1046,140 @@ def test_contact_phone_and_public_settings_validation():
         SettingsInput(logo_url="javascript:alert(1)")
     with pytest.raises(ValidationError):
         SettingsInput(accent_color="red")
+
+
+@pytest.mark.asyncio
+async def test_edit_reasons_duration_and_clinic_logo(
+    client, db_session, auth_headers, test_clinic, open_hours
+):
+    import base64
+
+    from app.core.auth.service import hash_password
+
+    professional = User(
+        id=uuid4(),
+        email=f"{uuid4()}@example.invalid",
+        password_hash=hash_password("Synthetic123!"),
+        first_name="Test",
+        last_name="Dentist",
+        is_active=True,
+    )
+    db_session.add(professional)
+    await db_session.flush()
+    db_session.add(
+        ClinicMembership(
+            id=uuid4(),
+            user_id=professional.id,
+            clinic_id=test_clinic.id,
+            role="dentist",
+            is_professional=True,
+        )
+    )
+    db_session.add(
+        BookingSettings(
+            clinic_id=test_clinic.id,
+            enabled=True,
+            professional_id=professional.id,
+            public_url="https://example.invalid/book",
+            slot_minutes=30,
+            window_days=30,
+            min_notice_minutes=0,
+        )
+    )
+    await db_session.commit()
+    headers = {**auth_headers, "X-Clinic-ID": str(test_clinic.id)}
+    settings_url = "/api/v1/online_booking/settings"
+    data = (await client.get(settings_url, headers=headers)).json()["data"]
+    data["reasons"].append(
+        {
+            "id": "extended",
+            "name_es": "Tratamiento largo",
+            "name_en": "Long treatment",
+            "duration_minutes": 75,
+            "active": True,
+        }
+    )
+    assert (await client.put(settings_url, headers=headers, json=data)).status_code == 200
+    base = f"/api/v1/online_booking/public/{test_clinic.id}"
+    reasons = (await client.get(f"{base}/config")).json()["data"]["reasons"]
+    assert reasons[-1]["id"] == "extended" and reasons[-1]["duration_minutes"] == 75
+    invalid = {**data, "reasons": data["reasons"] + [data["reasons"][-1]]}
+    assert (await client.put(settings_url, headers=headers, json=invalid)).status_code == 422
+    removed = {**data, "reasons": data["reasons"][:-1]}
+    assert (await client.put(settings_url, headers=headers, json=removed)).status_code == 422
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    start = datetime.combine(tomorrow, time(10), UTC)
+    config = await db_session.get(BookingSettings, test_clinic.id)
+    await db_session.refresh(config)
+    item = BookingRequest(
+        id=uuid4(),
+        clinic_id=test_clinic.id,
+        start_time=start,
+        end_time=start + timedelta(minutes=30),
+        status="pending_confirmation",
+        reason="extended",
+        confirmation_deadline=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    await reserve(db_session, test_clinic.id, config, item, datetime.now(UTC))
+    assert item.end_time - item.start_time == timedelta(minutes=75)
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>'
+    response = await client.put(
+        settings_url + "/logo",
+        headers=headers,
+        json={"content_type": "image/svg+xml", "data": base64.b64encode(svg).decode()},
+    )
+    assert response.status_code == 200
+    logo = await client.get(f"{base}/logo")
+    assert logo.content == svg and logo.headers["x-content-type-options"] == "nosniff"
+    malicious = base64.b64encode(
+        b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+    ).decode()
+    assert (
+        await client.put(
+            settings_url + "/logo",
+            headers=headers,
+            json={"content_type": "image/svg+xml", "data": malicious},
+        )
+    ).status_code == 422
+    assert (await client.delete(settings_url + "/logo", headers=headers)).status_code == 200
+    assert (await client.get(f"{base}/logo")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_availability_respects_existing_clinic_holiday(db_session, test_clinic):
+    from app.modules.online_booking.service import slots
+    from app.modules.schedules.models import ClinicOverride, ClinicWeeklySchedule, ScheduleShift
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    weekly = ClinicWeeklySchedule(clinic_id=test_clinic.id, is_active=True)
+    db_session.add(weekly)
+    await db_session.flush()
+    db_session.add(
+        ScheduleShift(
+            clinic_weekly_id=weekly.id,
+            weekday=tomorrow.weekday(),
+            start_time=time(9),
+            end_time=time(14),
+        )
+    )
+    config = BookingSettings(
+        clinic_id=test_clinic.id,
+        enabled=True,
+        slot_minutes=30,
+        window_days=30,
+        min_notice_minutes=0,
+    )
+    db_session.add(config)
+    await db_session.commit()
+    assert await slots(db_session, test_clinic.id, config, tomorrow, datetime.now(UTC))
+    db_session.add(
+        ClinicOverride(
+            clinic_id=test_clinic.id,
+            start_date=tomorrow,
+            end_date=tomorrow,
+            kind="closed",
+            reason="Synthetic holiday",
+        )
+    )
+    await db_session.commit()
+    assert await slots(db_session, test_clinic.id, config, tomorrow, datetime.now(UTC)) == []

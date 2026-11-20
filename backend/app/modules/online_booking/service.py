@@ -58,14 +58,20 @@ async def occupied(
 
 
 async def slots(
-    db: AsyncSession, clinic_id: UUID, config: BookingSettings, day: date, now: datetime
+    db: AsyncSession,
+    clinic_id: UUID,
+    config: BookingSettings,
+    day: date,
+    now: datetime,
+    duration_minutes: int | None = None,
 ) -> list[datetime]:
     tz_name, ranges = await AvailabilityService.resolve(db, clinic_id, day, day)
     zone = ZoneInfo(tz_name)
     today = now.astimezone(zone).date()
     if day < today or day > today + timedelta(days=config.window_days):
         return []
-    duration = timedelta(minutes=config.slot_minutes)
+    duration = timedelta(minutes=duration_minutes or config.slot_minutes)
+    step = timedelta(minutes=config.slot_minutes)
     windows = [window for window in ranges if window.state == "open"]
     if not windows:
         return []
@@ -101,7 +107,7 @@ async def slots(
                 begin < cursor + duration and finish > cursor for begin, finish in busy
             ):
                 result.append(cursor)
-            cursor += duration
+            cursor += step
     return result
 
 
@@ -114,12 +120,18 @@ async def reserve(
     await db.refresh(config)
     if not config.enabled:
         raise ValueError("Booking is disabled")
-    item.end_time = item.start_time + timedelta(minutes=config.slot_minutes)
+    reason = next(
+        (r for r in (config.reasons or []) if r["id"] == item.reason and r["active"]), None
+    )
+    if reason is None:
+        raise ValueError("Visit reason is no longer available")
+    duration_minutes = reason["duration_minutes"]
+    item.end_time = item.start_time + timedelta(minutes=duration_minutes)
     zone_name, _ = await AvailabilityService.resolve(
         db, clinic_id, item.start_time.date(), item.start_time.date()
     )
     day = item.start_time.astimezone(ZoneInfo(zone_name)).date()
-    allowed = await slots(db, clinic_id, config, day, now)
+    allowed = await slots(db, clinic_id, config, day, now, duration_minutes)
     if item.start_time.astimezone(UTC) not in allowed:
         raise ValueError("Time slot is no longer available")
     db.add(item)

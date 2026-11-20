@@ -8,7 +8,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +27,7 @@ from .locking import lock_clinic
 from .models import BookingRequest, BookingSettings
 from .outbox import enqueue
 from .rate_limit import consume_rate
-from .schemas import AcceptInput, ConfirmInput, RejectInput, RequestInput, SettingsInput
+from .schemas import AcceptInput, ConfirmInput, LogoInput, RejectInput, RequestInput, SettingsInput
 from .service import live_hold, occupied, reserve, slots
 
 router = APIRouter()
@@ -63,12 +63,15 @@ async def get_settings(
 async def public_config(request: Request, clinic_id: UUID, db: DB):
     await consume_rate("availability-ip", request.client.host if request.client else "unknown", 240)
     config = await public_settings(db, clinic_id)
+    result_logo = (
+        f"/api/v1/online_booking/public/{clinic_id}/logo" if config.logo_data else config.logo_url
+    )
     return {
         "data": {
             "slot_minutes": config.slot_minutes,
             "window_days": config.window_days,
             "branding": {
-                key: getattr(config, key)
+                key: result_logo if key == "logo_url" else getattr(config, key)
                 for key in (
                     "logo_url",
                     "accent_color",
@@ -79,7 +82,7 @@ async def public_config(request: Request, clinic_id: UUID, db: DB):
                 )
             },
             "timezone": await ClinicHoursService.get_clinic_timezone(db, clinic_id),
-            "reasons": ["first_visit", "checkup"],
+            "reasons": [reason for reason in config.reasons if reason["active"]],
         }
     }
 
@@ -102,10 +105,123 @@ async def update_settings(
     if config is None:
         config = BookingSettings(clinic_id=ctx.clinic_id)
         db.add(config)
+    elif config.reasons and not {r["id"] for r in config.reasons} <= {r.id for r in data.reasons}:
+        raise HTTPException(422, "Existing reasons must be retained; deactivate them instead")
     for key, value in data.model_dump().items():
         setattr(config, key, value)
+    for reason in data.reasons:
+        if reason.id in {"first_visit", "checkup"}:
+            setattr(config, f"{reason.id}_minutes", reason.duration_minutes)
     await db.flush()
     return {"data": data.model_dump(mode="json")}
+
+
+@router.put("/settings/logo")
+async def upload_logo(
+    data: LogoInput,
+    ctx: CTX,
+    db: DB,
+    _: Annotated[None, Depends(require_permission("online_booking.settings"))],
+):
+    import base64
+    import binascii
+    import io
+    import xml.etree.ElementTree as ET
+
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        raw = base64.b64decode(data.data, validate=True)
+        if not raw or len(raw) > 1024 * 1024:
+            raise ValueError("Image must be at most 1 MiB")
+        if data.content_type == "image/svg+xml":
+            svg_content = re.sub(rb"^\s*<\?xml[^?]*\?>", b"", raw, count=1)
+            if b"<!" in svg_content or b"<?" in svg_content:
+                raise ValueError("Unsupported SVG markup")
+            root = ET.fromstring(svg_content)
+            if root.tag != "{http://www.w3.org/2000/svg}svg":
+                raise ValueError("Invalid SVG")
+            allowed = {
+                "svg",
+                "g",
+                "path",
+                "rect",
+                "circle",
+                "ellipse",
+                "line",
+                "polyline",
+                "polygon",
+                "title",
+                "desc",
+            }
+            for element in root.iter():
+                if element.tag.split("}")[-1] not in allowed:
+                    raise ValueError("Unsupported SVG element")
+                for key, value in element.attrib.items():
+                    if (
+                        key.lower().split("}")[-1].startswith("on")
+                        or any(
+                            x in value.lower()
+                            for x in ("url(", "javascript:", "data:", "http:", "https:")
+                        )
+                        or key.lower().split("}")[-1] in {"href", "style"}
+                    ):
+                        raise ValueError("Unsupported SVG attribute")
+        else:
+            with Image.open(io.BytesIO(raw)) as image:
+                if image.format != {"image/png": "PNG", "image/jpeg": "JPEG"}[data.content_type]:
+                    raise ValueError("Image type does not match content")
+                if image.width * image.height > 16_000_000:
+                    raise ValueError("Image dimensions exceed limit")
+                image.verify()
+    except (
+        ValueError,
+        binascii.Error,
+        ET.ParseError,
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        OSError,
+    ) as exc:
+        raise HTTPException(422, "Invalid logo image") from exc
+    await lock_clinic(db, ctx.clinic_id)
+    config = await db.get(BookingSettings, ctx.clinic_id)
+    if config is None:
+        raise HTTPException(409, "Save booking settings first")
+    config.logo_data, config.logo_content_type = raw, data.content_type
+    await db.flush()
+    return {"data": {"uploaded": True}}
+
+
+@router.delete("/settings/logo")
+async def delete_logo(
+    ctx: CTX,
+    db: DB,
+    _: Annotated[None, Depends(require_permission("online_booking.settings"))],
+):
+    await lock_clinic(db, ctx.clinic_id)
+    config = await db.get(BookingSettings, ctx.clinic_id)
+    if config:
+        config.logo_data = None
+        config.logo_content_type = None
+        await db.flush()
+    return {"data": {"uploaded": False}}
+
+
+@router.get("/public/{clinic_id}/logo")
+@limiter.limit("60/minute")
+async def public_logo(request: Request, clinic_id: UUID, db: DB):
+    config = await public_settings(db, clinic_id)
+    if not config.logo_data or not config.logo_content_type:
+        raise HTTPException(404, "Logo unavailable")
+    return Response(
+        config.logo_data,
+        media_type=config.logo_content_type,
+        headers={
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/public/{clinic_id}/availability")
@@ -117,14 +233,23 @@ async def availability(
     day: date | None = None,
     from_day: date | None = None,
     days: int = Query(default=7, ge=1, le=31),
+    reason: str | None = Query(default=None, max_length=30),
 ):
     await consume_rate("availability-ip", request.client.host if request.client else "unknown", 240)
     config = await public_settings(db, clinic_id)
     if (day is None) == (from_day is None):
         raise HTTPException(422, "Provide day or from_day")
     now = datetime.now(UTC)
+    selected_reason = (
+        next((r for r in config.reasons if r["id"] == reason and r["active"]), None)
+        if reason
+        else None
+    )
+    if reason and selected_reason is None:
+        raise HTTPException(422, "Invalid visit reason")
+    duration_minutes = selected_reason["duration_minutes"] if selected_reason else None
     if day is not None:
-        starts = await slots(db, clinic_id, config, day, now)
+        starts = await slots(db, clinic_id, config, day, now, duration_minutes)
         return {
             "data": {
                 "starts": [start.isoformat() for start in starts],
@@ -136,7 +261,7 @@ async def availability(
     entries = []
     for offset in range(days):
         date_value = from_day + timedelta(days=offset)
-        starts = await slots(db, clinic_id, config, date_value, now)
+        starts = await slots(db, clinic_id, config, date_value, now, duration_minutes)
         entries.append(
             {"date": date_value.isoformat(), "starts": [start.isoformat() for start in starts]}
         )
@@ -308,14 +433,32 @@ async def list_requests(
                 "contact_email": row.contact_email,
                 "contact_phone": row.contact_phone,
                 "reason": row.reason,
+                "reason_name_es": next(
+                    (r["name_es"] for r in (config.reasons or []) if r["id"] == row.reason),
+                    row.reason,
+                )
+                if config
+                else row.reason,
+                "reason_name_en": next(
+                    (r["name_en"] for r in (config.reasons or []) if r["id"] == row.reason),
+                    row.reason,
+                )
+                if config
+                else row.reason,
                 "default_duration_minutes": (
                     getattr(config, f"{row.reason}_minutes", None)
-                    or (
-                        config.slot_minutes
-                        if config
-                        else int((row.end_time - row.start_time).total_seconds() / 60)
+                    or next(
+                        (
+                            r["duration_minutes"]
+                            for r in (config.reasons or [])
+                            if r["id"] == row.reason
+                        ),
+                        None,
                     )
-                ),
+                    or int((row.end_time - row.start_time).total_seconds() / 60)
+                )
+                if config
+                else int((row.end_time - row.start_time).total_seconds() / 60),
             }
             for row in rows[:page_size]
         ],
